@@ -16,81 +16,64 @@ const CONFIG = {
     'your-app-2': 'client-secret-for-app-2',
     'your-app-3': 'client-secret-for-app-3'
   },
-  GITHUB_DOWNLOAD_URL: 'https://github.com/emonxxx11/sECTECT-Exe/raw/main/EMON%20XTIER%20BYPASS.exe'
+  GITHUB_DOWNLOAD_URL: 'https://github.com/emonxxx11/sECTECT-Exe/raw/main/EMON%20XTIER%20BYPASS.exe',
+  MAX_DOWNLOADS_PER_HOUR: 10 // Limit downloads per IP
 };
 
 // Security middleware
 app.use(helmet());
 app.use(compression());
-
-// Rate limiting
-const limiter = rateLimit({
-  windowMs: 15 * 60 * 1000, // 15 minutes
-  max: 100, // limit each IP to 100 requests per windowMs
-  message: 'Too many requests from this IP, please try again later.'
-});
-app.use(limiter);
-
-// CORS configuration
 app.use(cors({
-  origin: process.env.ALLOWED_ORIGINS?.split(',') || ['http://localhost:3000'],
+  origin: false, // No CORS for security
   credentials: true
 }));
 
-// Body parsing middleware
-app.use(express.json({ limit: '50mb' }));
-app.use(express.urlencoded({ extended: true, limit: '50mb' }));
-
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.json({
-    status: 'healthy',
-    timestamp: new Date().toISOString(),
-    uptime: process.uptime(),
-    version: '1.0.0',
-    service: 'Firebase File Server'
-  });
+// Rate limiting
+const downloadLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000, // 1 hour
+  max: CONFIG.MAX_DOWNLOADS_PER_HOUR,
+  message: { error: 'Too many download attempts, please try again later' },
+  standardHeaders: true,
+  legacyHeaders: false,
 });
+
+// Body parsing
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ extended: true, limit: '10mb' }));
 
 // Authentication service
 class AuthService {
-  generateToken(clientId) {
-    const payload = {
-      clientId: clientId,
-      iat: Math.floor(Date.now() / 1000),
-      exp: Math.floor(Date.now() / 1000) + (24 * 60 * 60) // 24 hours
-    };
-
-    const token = crypto.createHmac('sha256', CONFIG.JWT_SECRET)
-      .update(JSON.stringify(payload))
-      .digest('hex');
-
-    return Buffer.from(JSON.stringify(payload)).toString('base64') + '.' + token;
-  }
-
-  verifyToken(token) {
-    try {
-      const parts = token.split('.');
-      if (parts.length !== 2) return null;
-
-      const payload = JSON.parse(Buffer.from(parts[0], 'base64').toString());
-      const signature = parts[1];
-
-      const expectedSignature = crypto.createHmac('sha256', CONFIG.JWT_SECRET)
-        .update(JSON.stringify(payload))
-        .digest('hex');
-
-      if (signature !== expectedSignature) return null;
-      if (payload.exp < Math.floor(Date.now() / 1000)) return null;
-
-      return payload;
-    } catch (error) {
-      return null;
-    }
+  constructor() {
+    this.secretKey = CONFIG.JWT_SECRET;
+    this.validClients = CONFIG.VALID_CLIENTS;
   }
 
   validateClient(clientId, clientSecret) {
-    return CONFIG.VALID_CLIENTS[clientId] === clientSecret;
+    return this.validClients[clientId] === clientSecret;
+  }
+
+  generateToken(clientId) {
+    const payload = {
+      clientId: clientId,
+      timestamp: Date.now(),
+      exp: Date.now() + (60 * 60 * 1000) // 1 hour expiry
+    };
+    
+    const token = crypto.createHmac('sha256', this.secretKey)
+      .update(JSON.stringify(payload))
+      .digest('hex');
+    
+    return token;
+  }
+
+  verifyToken(token, clientId) {
+    try {
+      // Simple token verification (in production, use proper JWT)
+      const expectedToken = this.generateToken(clientId);
+      return token === expectedToken;
+    } catch (error) {
+      return false;
+    }
   }
 }
 
@@ -101,11 +84,11 @@ class GitHubFileService {
   constructor() {
     this.downloadUrl = CONFIG.GITHUB_DOWNLOAD_URL;
   }
-
+  
   getDownloadUrl() {
     return this.downloadUrl;
   }
-
+  
   async getFileInfo() {
     return {
       url: this.downloadUrl,
@@ -118,149 +101,92 @@ class GitHubFileService {
 
 const githubFileService = new GitHubFileService();
 
-// Authentication endpoints
-app.post('/api/auth/login', async (req, res) => {
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.json({
+    status: 'healthy',
+    timestamp: new Date().toISOString(),
+    uptime: process.uptime(),
+    version: '1.0.0',
+    service: 'Secure File Server'
+  });
+});
+
+// Authentication endpoint
+app.post('/api/auth/login', (req, res) => {
   try {
     const { clientId, clientSecret } = req.body;
     
     if (!clientId || !clientSecret) {
-      return res.status(400).json({ error: 'Client ID and Client Secret are required' });
+      return res.status(400).json({ error: 'Client ID and secret required' });
     }
-
-    const isValid = authService.validateClient(clientId, clientSecret);
-    if (!isValid) {
+    
+    if (!authService.validateClient(clientId, clientSecret)) {
       return res.status(401).json({ error: 'Invalid client credentials' });
     }
-
+    
     const token = authService.generateToken(clientId);
     
     res.json({
-      token,
-      expiresIn: 86400, // 24 hours
-      tokenType: 'Bearer'
+      success: true,
+      token: token,
+      expiresIn: 3600, // 1 hour
+      message: 'Authentication successful'
     });
   } catch (error) {
-    console.error('Login error:', error);
+    console.error('Auth error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Middleware for protected routes
-const authenticateToken = (req, res, next) => {
-  const authHeader = req.headers['authorization'];
-  const token = authHeader && authHeader.split(' ')[1];
-
-  if (!token) {
-    return res.status(401).json({ error: 'Access token required' });
+// Middleware to verify authentication
+const verifyAuth = (req, res, next) => {
+  const token = req.headers.authorization?.replace('Bearer ', '');
+  const clientId = req.headers['x-client-id'];
+  
+  if (!token || !clientId) {
+    return res.status(401).json({ error: 'Authentication required' });
   }
-
-  const decoded = authService.verifyToken(token);
-  if (!decoded) {
-    return res.status(403).json({ error: 'Invalid or expired token' });
+  
+  if (!authService.verifyToken(token, clientId)) {
+    return res.status(401).json({ error: 'Invalid token' });
   }
-
-  req.clientId = decoded.clientId;
+  
   next();
 };
 
-// Main download endpoint
-app.get('/api/download/main-exe', async (req, res) => {
+// Main download endpoint (now requires authentication)
+app.get('/api/download/main-exe', downloadLimiter, verifyAuth, async (req, res) => {
   try {
     console.log('🔥 Serving main executable from GitHub...');
-    
     console.log(`📥 Redirecting to: ${CONFIG.GITHUB_DOWNLOAD_URL}`);
+    console.log(`🔐 Authenticated client: ${req.headers['x-client-id']}`);
     
-    // Redirect to the direct download link
     res.redirect(CONFIG.GITHUB_DOWNLOAD_URL);
-
   } catch (error) {
     console.error('Error serving main executable:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
 });
 
-// Helper function to detect ZIP files
-function isZipFile(buffer) {
-  return buffer[0] === 0x50 && buffer[1] === 0x4B;
-}
-
-// Upload file endpoint
-app.post('/api/files/upload', authenticateToken, async (req, res) => {
+// File info endpoint (requires authentication)
+app.get('/api/files/info', verifyAuth, async (req, res) => {
   try {
-    const { fileName, fileData } = req.body;
-    
-    if (!fileName || !fileData) {
-      return res.status(400).json({ error: 'File name and data are required' });
-    }
-
-    const allowedExtensions = ['.exe', '.zip', '.rar'];
-    const hasValidExtension = allowedExtensions.some(ext => fileName.toLowerCase().endsWith(ext));
-    
-    if (!hasValidExtension) {
-      return res.status(400).json({ error: 'Only .exe, .zip, and .rar files are allowed' });
-    }
-
-    console.log(`Client ${req.clientId} uploading file: ${fileName}`);
-
-    // Decode base64 file data
-    const fileBuffer = Buffer.from(fileData, 'base64');
-    
-    // Encrypt the file
-    const encryptedData = fileService.encryptFile(fileBuffer);
-    
-    // Upload to Firebase Storage
-    const file = bucket.file(fileName);
-    await file.save(encryptedData);
-    
-    res.json({
-      fileName,
-      fileSize: fileBuffer.length,
-      uploadedAt: new Date().toISOString(),
-      message: 'File uploaded successfully to Firebase Storage'
-    });
+    const fileInfo = await githubFileService.getFileInfo();
+    res.json(fileInfo);
   } catch (error) {
-    console.error('Upload error:', error);
+    console.error('Error getting file info:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
-});
-
-// List files endpoint
-app.get('/api/files/list', authenticateToken, async (req, res) => {
-  try {
-    console.log(`Client ${req.clientId} listing files`);
-
-    const [files] = await bucket.getFiles();
-    const fileList = files.map(file => ({
-      name: file.name,
-      size: file.metadata.size,
-      created: file.metadata.timeCreated,
-      updated: file.metadata.updated
-    }));
-    
-    res.json({ files: fileList });
-  } catch (error) {
-    console.error('List files error:', error);
-    res.status(500).json({ error: 'Internal server error' });
-  }
-});
-
-// Error handling middleware
-app.use((err, req, res, next) => {
-  console.error('Unhandled error:', err);
-  res.status(500).json({ error: 'Internal server error' });
-});
-
-// 404 handler
-app.use('*', (req, res) => {
-  res.status(404).json({ error: 'Endpoint not found' });
 });
 
 // Start server
 app.listen(PORT, '0.0.0.0', () => {
-  console.log(`🔥 Firebase File Server running on port ${PORT}`);
-  console.log(`📁 Firebase Storage integration enabled`);
-  console.log(`🔒 Security features active`);
-  console.log(`🌐 Server accessible at: https://your-app-name.onrender.com`);
+  console.log(`🚀 Secure server running on port ${PORT}`);
+  console.log(`📁 GitHub direct download enabled`);
+  console.log(`🔒 Authentication required for downloads`);
+  console.log(`⏱️ Rate limiting: ${CONFIG.MAX_DOWNLOADS_PER_HOUR} downloads/hour`);
+  console.log(`🌐 Server accessible at: https://svc-vxk0.onrender.com`);
 });
 
 module.exports = app;
